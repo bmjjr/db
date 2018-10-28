@@ -30,12 +30,13 @@ class Connection:
         return _search.search(self, query, *args, **kw)
     search.__doc__ = _search.search.__doc__
 
-    def search_batch(self, query, args, batch_start, batch_size):
+    def search_batch(self, query, args, batch_start, batch_size=None):
         return _search.search_batch(self, query, args, batch_start, batch_size)
     search_batch.__doc__ = _search.search_batch.__doc__
 
-    def create_text_index(self, fname, D=None, C=None, B=None, A=None):
-        return _search.create_text_index(self, fname, D, C, B, A)
+    def create_text_index(self, fname, D=None, C=None, B=None, A=None,
+                          config=None):
+        return _search.create_text_index(self, fname, D, C, B, A, config)
     create_text_index.__doc__ = _search.create_text_index.__doc__
 
     def create_text_index_sql(fname, D=None, C=None, B=None, A=None):
@@ -51,7 +52,7 @@ class Connection:
         return _search.where(self, query_tail, *args, **kw)
     where.__doc__ = _search.where.__doc__
 
-    def where_batch(self, query_tail, args, batch_start, batch_size):
+    def where_batch(self, query_tail, args, batch_start, batch_size=None):
         return _search.where_batch(
             self, query_tail, args, batch_start, batch_size)
     where_batch.__doc__ = _search.where_batch.__doc__
@@ -108,7 +109,7 @@ def _split_options(
         large_record_size=large_record_size,
         ), storage_options
 
-def storage(dsn, keep_history=False, transform=None, reducer=None, **kw):
+def storage(dsn, keep_history=False, transform=None, auxiliary_tables=(), **kw):
     """Create a RelStorage storage using the newt PostgresQL adapter.
 
     Keyword options can be used to provide either `ZODB.DB
@@ -118,8 +119,8 @@ def storage(dsn, keep_history=False, transform=None, reducer=None, **kw):
     options.
     """
     options = relstorage.options.Options(keep_history=keep_history, **kw)
-    options.reducer = reducer
     options.transform = transform
+    options.auxiliary_tables = auxiliary_tables
     return relstorage.storage.RelStorage(Adapter(dsn, options), options=options)
 
 def DB(dsn, **kw):

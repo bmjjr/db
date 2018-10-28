@@ -33,15 +33,17 @@ def search(conn, query, *args, **kw):
                             " not both")
         args = kw
     get = conn.ex_get
-    cursor = conn._storage.ex_cursor()
+    cursor = read_only_cursor(conn)
     try:
-        cursor.execute("select zoid, ghost_pickle from (%s)_" % query,
-                       args or kw)
+        cursor.execute(b"select zoid, ghost_pickle from (" + query + b")_"
+                       if isinstance(query, bytes) else
+                       "select zoid, ghost_pickle from (" + query + ")_",
+                       args or None)
         return [get(p64(zoid), ghost_pickle) for (zoid, ghost_pickle) in cursor]
     finally:
         _try_to_close_cursor(cursor)
 
-def search_batch(conn, query, args, batch_start, batch_size):
+def search_batch(conn, query, args, batch_start, batch_size=None):
     """Query for a batch of newt objects.
 
     Query parameters are provided using the ``args``
@@ -56,16 +58,41 @@ def search_batch(conn, query, args, batch_start, batch_size):
 
     The total result count and sequence of batch result objects
     are returned.
+
+    The query parameters, ``args``, may be omitted. (In this case,
+    ``batch_size`` will be None and the other arguments will be
+    re-arranged appropriately. ``batch_size`` *is required*.)  You
+    might use this feature if you pre-inserted data using a database
+    cursor `mogrify
+    <http://initd.org/psycopg/docs/cursor.html#cursor.mogrify>`_
+    method.
     """
-    query = """
-    select zoid, ghost_pickle, count(*) over()
-    from (%s) _
-    offset %s limit %s
-    """ % (query, batch_start, batch_size)
+    if not batch_size:
+        if isinstance(args, int):
+            batch_size = batch_start
+            batch_start = args
+            args = None
+        else:
+            raise AssertionError("Invalid batch size %r" % batch_size)
+
+    if isinstance(query, str):
+        query = """select zoid, ghost_pickle, count(*) over()
+        from (%s) _
+        offset %d limit %d
+        """ % (query, batch_start, batch_size)
+    else:
+        # Python 3.4, whimper
+        query = (
+            b"select zoid, ghost_pickle, count(*) over()\nfrom (" +
+            query +
+            (") _\noffset %s limit %d" % (batch_start, batch_size)
+             ).encode('ascii')
+            )
+
     get = conn.ex_get
-    cursor = conn._storage.ex_cursor()
+    cursor = read_only_cursor(conn)
     try:
-        cursor.execute(query, args)
+        cursor.execute(query, args or None)
         count = 0
         result = []
         for zoid, ghost_pickle, count in cursor:
@@ -88,7 +115,7 @@ end
 $$ language plpgsql immutable;
 """
 
-def _texts(texts, exprs, weight=None):
+def _texts(texts, exprs, weight=None, config=None):
     if not exprs:
         return
 
@@ -109,7 +136,11 @@ def _texts(texts, exprs, weight=None):
             text = "text || " + text
         texts.append("  text = %s;" % text)
 
-    tsvector = 'to_tsvector(text)'
+    if config:
+        tsvector = 'to_tsvector(%r, text)' % config
+    else:
+        tsvector = 'to_tsvector(text)'
+
     if weight:
         tsvector = "setweight(%s, '%s')" % (tsvector, weight)
 
@@ -120,7 +151,7 @@ def _texts(texts, exprs, weight=None):
 
 
 identifier = re.compile(r'\w+$').match
-def create_text_index_sql(fname, D=None, C=None, B=None, A=None):
+def create_text_index_sql(fname, D=None, C=None, B=None, A=None, config=None):
     """Compute and return SQL to set up a newt text index.
 
     The resulting SQL contains a statement to create a
@@ -139,12 +170,18 @@ def create_text_index_sql(fname, D=None, C=None, B=None, A=None):
     supply expressions and/or names for text to be extracted with
     different weights for ranking.  See:
     https://www.postgresql.org/docs/current/static/textsearch-controls.html#TEXTSEARCH-RANKING
+
+    The ``config`` argument may be used to specify which `text search
+    configuration
+    <https://www.postgresql.org/docs/current/static/textsearch-intro.html#TEXTSEARCH-INTRO-CONFIGURATIONS>`_
+    to use. If not specified, the server-configured default
+    configuration is used.
     """
     texts = []
-    _texts(texts, D)
-    _texts(texts, C, 'C')
-    _texts(texts, B, 'B')
-    _texts(texts, A, 'A')
+    _texts(texts, D, config=config)
+    _texts(texts, C, 'C', config=config)
+    _texts(texts, B, 'B', config=config)
+    _texts(texts, A, 'A', config=config)
 
     if not texts:
         raise TypeError("No text expressions were specified")
@@ -155,7 +192,7 @@ def create_text_index_sql(fname, D=None, C=None, B=None, A=None):
                  % (fname, fname))
     return '\n'.join(texts)
 
-def create_text_index(conn, fname, D, C=None, B=None, A=None):
+def create_text_index(conn, fname, D, C=None, B=None, A=None, config=None):
     """Set up a newt full-text index.
 
     The ``create_text_index_sql`` method is used to compute SQL, which
@@ -166,8 +203,8 @@ def create_text_index(conn, fname, D, C=None, B=None, A=None):
     connection, but a separate connection is used, so it's execution
     is independent of the current transaction.
     """
-    conn, cursor = conn._storage.ex_connect()
-    sql = create_text_index_sql(fname, D, C, B, A)
+    conn, cursor = _storage(conn).ex_connect()
+    sql = create_text_index_sql(fname, D, C, B, A, config)
     try:
         cursor.execute(sql)
         conn.commit()
@@ -196,7 +233,8 @@ def query_data(conn, query, *args, **kw):
             raise TypeError("Only positional or keyword arguments"
                             " may be provided, not both.")
         args = kw
-    cursor = conn._connection._storage.ex_cursor()
+
+    cursor = read_only_cursor(conn)
     try:
         cursor.execute(query, args)
         result = list(cursor)
@@ -230,10 +268,14 @@ def where(conn, query_tail, *args, **kw):
     A sequence of newt objects is returned.
     """
     return search(conn,
-                  "select * from newt where " + query_tail,
+                  (b"select * from newt where "
+                   if isinstance(query_tail, bytes) else
+                   "select * from newt where "
+                   ) +
+                  query_tail,
                   *args, **kw)
 
-def where_batch(conn, query_tail, args, batch_start, batch_size):
+def where_batch(conn, query_tail, args, batch_start, batch_size=None):
     """Query for batch of objects satisfying criteria
 
     Like the ``where`` method, this is a convenience wrapper for
@@ -251,7 +293,39 @@ def where_batch(conn, query_tail, args, batch_start, batch_size):
 
     The total result count and sequence of batch result objects
     are returned.
+
+    The query parameters, ``args``, may be omitted. (In this case,
+    ``batch_size`` will be None and the other arguments will be
+    re-arranged appropriately. ``batch_size`` *is required*.)  You
+    might use this feature if you pre-inserted data using a database
+    cursor `mogrify
+    <http://initd.org/psycopg/docs/cursor.html#cursor.mogrify>`_
+    method.
     """
+
     return search_batch(conn,
-                        "select * from newt where " + query_tail,
+                        (b"select * from newt where "
+                         if isinstance(query_tail, bytes) else
+                         "select * from newt where ")
+                        + query_tail,
                         args, batch_start, batch_size)
+
+
+def _storage(conn):
+    try:
+        return conn._storage
+    except AttributeError:
+        return conn._p_jar._storage
+
+def read_only_cursor(conn):
+    """Get a database cursor for reading.
+
+    The returned `cursor
+    <http://initd.org/psycopg/docs/cursor.html>`_ can be used to
+    make PostgreSQL queries and to perform safe SQL generation
+    using the `cursor's mogrify method
+    <http://initd.org/psycopg/docs/cursor.html#cursor.mogrify>`_.
+
+    The caller must close the returned cursor after use.
+    """
+    return _storage(conn).ex_cursor()

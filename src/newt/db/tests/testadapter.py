@@ -1,3 +1,4 @@
+import contextlib
 import persistent.mapping
 import os
 import pickle
@@ -38,6 +39,7 @@ class AdapterTests(DBSetup, unittest.TestCase):
         self.assertEqual(class_name, 'persistent.mapping.PersistentMapping')
         self.assertEqual(pickle.loads(ghost_pickle),
                          persistent.mapping.PersistentMapping)
+        from pprint import pprint
         self.assertEqual(
             state,
             {'data': {'x': {'id': [1, 'newt.db._object.Object'],
@@ -52,6 +54,43 @@ class AdapterTests(DBSetup, unittest.TestCase):
         conn.commit()
 
         self.__assertBasicData(conn, o)
+
+        conn.close()
+
+    def test_basic_auxiliary_tables(self):
+        import newt.db
+
+        conn = newt.db.pg_connection(self.dsn)
+        with conn:
+            with conn.cursor() as cursor:
+                for i in range(1, 3):
+                    cursor.execute(
+                        "create table x%s (zoid bigint primary key, x int)"
+                        % i)
+        conn.close()
+
+        conn = newt.db.connection(
+            self.dsn,
+            keep_history=self.keep_history,
+            auxiliary_tables=('x1', 'x2'),
+            )
+
+        # Add an object:
+        conn.root.x = o = Object(a=1)
+        conn.commit()
+        self.__assertBasicData(conn, o)
+
+        # Add a BTree too. It shouldn't show up in the aux tables.
+        import BTrees.OOBTree
+        conn.root.b = BTrees.OOBTree.BTree()
+        conn.commit()
+
+        for i in range(1, 3):
+            self.assertEqual(
+                [[0], [1]],
+                [list(map(int, r))
+                 for r in conn.query_data(
+                     'select zoid from x%s order by zoid' % i)])
 
         conn.close()
 
@@ -122,6 +161,28 @@ class AdapterTests(DBSetup, unittest.TestCase):
         where table_schema = 'public' AND table_name = 'newt'
         """)
         self.assertEqual([], list(cursor))
+
+    def test_newt_on_existing_db(self):
+        import ZODB.config
+        import newt.db
+        db = ZODB.config.databaseFromString("""\
+        %%import relstorage
+        <zodb>
+          <relstorage>
+            keep-history false
+            <postgresql>
+              dsn %s
+            </postgresql>
+          </relstorage>
+        </zodb>
+        """ % self.dsn)
+        with db.transaction() as conn:
+            conn.root.x = Object(a=1)
+        db.close()
+
+        conn = newt.db.connection(self.dsn)
+        self.assertEqual(conn.root.x.a, 1)
+        conn.close()
 
 class HPAdapterTests(AdapterTests):
 

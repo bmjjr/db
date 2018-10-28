@@ -1,7 +1,6 @@
 from ZODB.utils import u64
 import unittest
 
-
 from .. import Object
 from .base import DBSetup
 
@@ -56,6 +55,10 @@ class SearchTests(DBSetup, unittest.TestCase):
                             a='2', b='5')
         self.assertEqual([2, 3, 4, 5], sorted(o.i for o in obs2))
 
+        # Test allready-mogrified data:
+        obs2 = search.where(self.conn,
+                            b"state->>'i' >= '2' and state->>'i' <= '5'")
+        self.assertEqual([2, 3, 4, 5], sorted(o.i for o in obs2))
 
     def test_search_batch(self):
         for i in range(99):
@@ -70,7 +73,6 @@ class SearchTests(DBSetup, unittest.TestCase):
         """
         total, batch = conn2.search_batch(sql, dict(a=2, b=90), 10, 20)
         self.assertEqual(total, 89)
-
         self.assertEqual(list(range(12, 32)), [o.i for o in batch])
 
         # We didn't end up with all of the objects getting loaded:
@@ -81,6 +83,29 @@ class SearchTests(DBSetup, unittest.TestCase):
         totalbatch = search.search_batch(
             conn2, sql, dict(a=2, b=90), 10, 20)
         self.assertEqual((total, batch), totalbatch)
+
+        # where_batch:
+        total, batch = conn2.where_batch(
+            "(state->>'i')::int >= %(a)s and (state->>'i')::int <= %(b)s"
+            " order by zoid", dict(a=2, b=90), 10, 20)
+        self.assertEqual(total, 89)
+        self.assertEqual(list(range(12, 32)), [o.i for o in batch])
+
+        # where_batch binary/pre-mogrified:
+        total, batch = conn2.where_batch(
+            b"(state->>'i')::int >= 2 and (state->>'i')::int <= 90"
+            b" order by zoid", 10, 20)
+        self.assertEqual(total, 89)
+        self.assertEqual(list(range(12, 32)), [o.i for o in batch])
+
+    def test_search_no_args_no_problem_w_percent(self):
+        self.assertEqual(
+            [],
+            list(self.conn.search("select * from newt where 'x' like 'y%'")))
+        self.assertEqual(
+            (0, []),
+            self.conn.search_batch(
+                "select * from newt where 'x' like 'y%'", 1, 10))
 
     def test_create_text_index_sql(self):
         from .. import search
@@ -100,6 +125,12 @@ class SearchTests(DBSetup, unittest.TestCase):
         self.assertEqual(
             expect_text,
             search.create_text_index_sql('mytext', ['text', 'title']),
+            )
+
+        self.assertEqual(
+            expect_text_klingon,
+            search.create_text_index_sql('mytext', ['text', 'title'],
+                                         config='klingon'),
             )
 
         self.assertEqual(
@@ -144,6 +175,14 @@ class SearchTests(DBSetup, unittest.TestCase):
         self.assertRaises(TypeError, self.conn.create_text_index_sql, 'mytext')
         self.assertRaises(TypeError, search.create_text_index_sql, 'mytext')
 
+    def test_create_text_index_arg_passthrough(self):
+        import mock
+        with mock.patch("newt.db.search.create_text_index_sql") as f:
+            f.return_value = 'select'
+            self.conn.create_text_index('txt', 'text', 'C', 'B', 'A',
+                                        config='Klingon')
+            f.assert_called_with('txt', 'text', 'C', 'B', 'A', 'Klingon')
+
     def test_create_text_index(self):
         self.conn.create_text_index('txt', 'text')
         self.store('a', text='foo bar')
@@ -165,6 +204,26 @@ class SearchTests(DBSetup, unittest.TestCase):
     def test_create_text_index_standalone(self):
         from .. import search
         search.create_text_index(self.conn, 'txt', 'text')
+        self.store('a', text='foo bar')
+        self.store('b', text='foo baz')
+        self.store('c', text='green eggs and spam')
+        self.assertEqual(
+            set((self.conn.root.a, self.conn.root.b)),
+            set(self.conn.where("txt(state) @@ 'foo'")),
+            )
+        self.assertEqual(
+            set((self.conn.root.a, )),
+            set(self.conn.where("txt(state) @@ 'foo & bar'")),
+            )
+        self.assertEqual(
+            set((self.conn.root.a, self.conn.root.c)),
+            set(self.conn.where("txt(state) @@ 'bar | green'")),
+            )
+
+    def test_create_text_index_db_object(self):
+        from .. import search
+        conn = self.conn.root()
+        search.create_text_index(conn, 'txt', 'text')
         self.store('a', text='foo bar')
         self.store('b', text='foo baz')
         self.store('c', text='green eggs and spam')
@@ -203,6 +262,26 @@ class SearchTests(DBSetup, unittest.TestCase):
                  where state @> '{"text": "foo bar"}'""")
              ])
 
+        # Make sure we can search using a ZODB connection:
+        self.assertEqual(
+            [[1]],
+            [list(map(int, r)) for r in
+             search.query_data(
+                 self.conn._connection,
+                 """select zoid from newt
+                 where state @> '{"text": "foo bar"}'""")
+             ])
+
+        # For good mesaue, we can search with a persistent object:
+        self.assertEqual(
+            [[1]],
+            [list(map(int, r)) for r in
+             search.query_data(
+                 self.conn._connection.root(),
+                 """select zoid from newt
+                 where state @> '{"text": "foo bar"}'""")
+             ])
+
 expect_simple_text = """\
 create or replace function mytext(state jsonb) returns tsvector as $$
 declare
@@ -232,6 +311,25 @@ begin
   text = coalesce(state ->> 'text', '');
   text = text || coalesce(state ->> 'title', '');
   result := to_tsvector(text);
+
+  return result;
+end
+$$ language plpgsql immutable;
+
+create index newt_mytext_idx on newt using gin (mytext(state));
+"""
+
+expect_text_klingon = """\
+create or replace function mytext(state jsonb) returns tsvector as $$
+declare
+  text text;
+  result tsvector;
+begin
+  if state is null then return null; end if;
+
+  text = coalesce(state ->> 'text', '');
+  text = text || coalesce(state ->> 'title', '');
+  result := to_tsvector('klingon', text);
 
   return result;
 end

@@ -27,16 +27,22 @@ class Adapter(relstorage.adapters.postgresql.PostgreSQLAdapter):
         self.connmanager.set_on_store_opened(self.mover.on_store_opened)
 
         self.mover.jsonifier = Jsonifier(
-            transform=getattr(self.options, 'transform', None),
-            reducer=getattr(self.options, 'reducer', None)
-            )
+            transform=getattr(self.options, 'transform', None))
+        self.mover.auxiliary_tables = getattr(self.options,
+                                              'auxiliary_tables', ())
 
 class Mover(relstorage.adapters.postgresql.mover.PostgreSQLObjectMover):
 
     def on_store_opened(self, cursor, restart=False):
-        super(Mover, self).on_store_opened(cursor, restart)
+        cursor.execute("""\
+        select from information_schema.tables
+        where table_name = 'temp_store' and table_type = 'LOCAL TEMPORARY'
+        """)
+        if not list(cursor):
+            super(Mover, self).on_store_opened(cursor, restart)
+
         cursor.execute("""
-            CREATE TEMPORARY TABLE temp_store_json (
+            CREATE TEMPORARY TABLE IF NOT EXISTS temp_store_json (
                 zoid         BIGINT NOT NULL,
                 class_name   TEXT,
                 ghost_pickle BYTEA,
@@ -58,16 +64,28 @@ class Mover(relstorage.adapters.postgresql.mover.PostgreSQLObjectMover):
             )
 
     _move_json_sql = """
-    DELETE FROM newt WHERE zoid IN (SELECT zoid FROM temp_store);
+    LOCK TABLE newt IN SHARE MODE;
 
     INSERT INTO newt (zoid, class_name, ghost_pickle, state)
     SELECT zoid, class_name, ghost_pickle, state
-    FROM temp_store_json
+    FROM temp_store_json order by zoid
+    ON CONFLICT (zoid) DO UPDATE SET
+      class_name = EXCLUDED.class_name,
+      ghost_pickle = EXCLUDED.ghost_pickle,
+      state = EXCLUDED.state;
+    """
+
+    _update_aux_sql = """
+    DELETE FROM %(name)s WHERE zoid IN (SELECT zoid FROM temp_store);
+    INSERT INTO %(name)s (zoid)
+    SELECT zoid FROM temp_store join newt using (zoid);
     """
 
     def move_from_temp(self, cursor, tid, txn_has_blobs):
         r = super(Mover, self).move_from_temp(cursor, tid, txn_has_blobs)
         cursor.execute(self._move_json_sql)
+        for name in self.auxiliary_tables:
+            cursor.execute(self._update_aux_sql % dict(name=name))
         return r
 
     def restore(self, cursor, batcher, oid, tid, data):
@@ -144,7 +162,7 @@ class SchemaInstaller(
 
     def update_schema(self, cursor, tables):
         if 'newt' not in tables:
-            self._create_newt(cursor)
+            create_newt(cursor)
         if not trigger_exists(cursor, DELETE_TRIGGER):
             _create_newt_delete_trigger(cursor, self.keep_history)
 

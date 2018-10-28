@@ -1,22 +1,24 @@
 import relstorage.storage
 import relstorage.adapters.postgresql
 
+def global_by_name(name):
+    mod, func = name.rsplit('.', 1)
+    mod = __import__(mod, {}, {}, ['*'])
+    return getattr(mod, func)
+
 class Adapter:
 
     def __init__(self, config):
+        self.auxiliary_tables = config.auxiliary_tables
         self.transform = config.transform
-        self.reducer = config.reducer
         self.config = config.adapter.config
 
     def create(self, options):
         from ._adapter import Adapter
-        for name in 'transform', 'reducer':
-            f = getattr(self, name)
-            if f is not None:
-                mod, func = f.rsplit('.', 1)
-                mod = __import__(mod, {}, {}, ['*'])
-                f = getattr(mod, func)
-                setattr(options, name, f)
+        transform = self.transform
+        if transform is not None:
+            options.transform = global_by_name(transform)
+        options.auxiliary_tables = self.auxiliary_tables or ()
 
         return Adapter(dsn=self.config.dsn, options=options)
 
